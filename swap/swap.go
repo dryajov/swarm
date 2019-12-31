@@ -145,7 +145,7 @@ func newSwapInstance(stateStore state.Store, owner *Owner, backend contract.Back
 		chequebookFactory: chequebookFactory,
 		honeyPriceOracle:  NewHoneyPriceOracle(),
 		chainID:           chainID,
-		cashoutProcessor:  newCashoutProcessor(backend, owner.privateKey),
+		cashoutProcessor:  newCashoutProcessor(stateStore, backend, owner.privateKey),
 	}
 }
 
@@ -232,6 +232,8 @@ func New(dbPath string, prvkey *ecdsa.PrivateKey, backendURL string, params *Par
 			swapLog.Info("Skipping deposit")
 		}
 	}
+
+	swap.cashoutProcessor.start()
 
 	return swap, nil
 }
@@ -364,8 +366,6 @@ func (s *Swap) handleMsg(p *Peer) func(ctx context.Context, msg interface{}) err
 	}
 }
 
-var defaultCashCheque = cashCheque
-
 // handleEmitChequeMsg should be handled by the creditor when it receives
 // a cheque from a debitor
 func (s *Swap) handleEmitChequeMsg(ctx context.Context, p *Peer, msg *EmitChequeMsg) error {
@@ -410,17 +410,13 @@ func (s *Swap) handleEmitChequeMsg(ctx context.Context, p *Peer, msg *EmitCheque
 		return err
 	}
 
-	expectedPayout, transactionCosts, err := s.cashoutProcessor.estimatePayout(context.TODO(), cheque)
-	if err != nil {
-		return err
-	}
+	s.cashoutProcessor.queueRequest(&CashoutRequest{
+		Peer:        p.ID(),
+		Cheque:      *cheque,
+		Destination: s.GetParams().ContractAddress,
+	})
 
-	// do a payout transaction if we get 2 times the gas costs
-	if expectedPayout > 2*transactionCosts {
-		go defaultCashCheque(s, cheque)
-	}
-
-	return err
+	return nil
 }
 
 func (s *Swap) handleConfirmChequeMsg(ctx context.Context, p *Peer, msg *ConfirmChequeMsg) {
@@ -448,19 +444,6 @@ func (s *Swap) handleConfirmChequeMsg(ctx context.Context, p *Peer, msg *Confirm
 	if err != nil {
 		p.Drop(fmt.Sprintf("persistence error: %v", err))
 		return
-	}
-}
-
-// cashCheque should be called async as it blocks until the transaction(s) are mined
-// The function cashes the cheque by sending it to the blockchain
-func cashCheque(s *Swap, cheque *Cheque) {
-	err := s.cashoutProcessor.cashCheque(context.Background(), &CashoutRequest{
-		Cheque:      *cheque,
-		Destination: s.GetParams().ContractAddress,
-	})
-
-	if err != nil {
-		swapLog.Error(err.Error())
 	}
 }
 
@@ -566,6 +549,7 @@ func (s *Swap) saveBalance(p enode.ID, balance int64) error {
 
 // Close cleans up swap
 func (s *Swap) Close() error {
+	s.cashoutProcessor.stop()
 	return s.store.Close()
 }
 
